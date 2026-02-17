@@ -3,10 +3,38 @@
  * Based on UPS Rating API (Shop for rates). Request/response shapes follow UPS docs.
  */
 
+import { z } from "zod";
 import type { HttpClient } from "../../http-client.js";
 import type { RateRequest, RateResponse, RateQuote, Address, Package } from "../../domain.js";
 import { CarrierIntegrationError } from "../../errors.js";
 import type { UpsConfig } from "../../config.js";
+
+/** Runtime validation for UPS rate API response. */
+const UpsRatedShipmentSchema = z.object({
+  Service: z.object({ Code: z.string().optional(), Name: z.string().optional() }).optional(),
+  TotalCharges: z
+    .object({
+      MonetaryValue: z.string().optional(),
+      CurrencyCode: z.string().optional(),
+    })
+    .optional(),
+  GuaranteedDelivery: z.object({ BusinessDaysInTransit: z.string().optional() }).optional(),
+});
+
+const UpsRateResponseSchema = z.object({
+  RateResponse: z
+    .object({
+      Response: z
+        .object({
+          ResponseStatus: z
+            .object({ Code: z.string().optional(), Description: z.string().optional() })
+            .optional(),
+        })
+        .optional(),
+      RatedShipment: z.array(UpsRatedShipmentSchema).optional(),
+    })
+    .optional(),
+});
 
 const UPS_RATING_PATH = "/api/ratings/v1/Shop";
 const UPS_RATE_VERSION = "v1";
@@ -45,18 +73,6 @@ interface UpsPackage {
   PackageWeight?: {
     UnitOfMeasurement?: { Code?: string };
     Weight?: string;
-  };
-}
-
-/** UPS Rating API response (simplified). */
-export interface UpsRateResponse {
-  RateResponse?: {
-    Response?: { ResponseStatus?: { Code?: string; Description?: string } };
-    RatedShipment?: Array<{
-      Service?: { Code?: string; Name?: string };
-      TotalCharges?: { MonetaryValue?: string; CurrencyCode?: string };
-      GuaranteedDelivery?: { BusinessDaysInTransit?: string };
-    }>;
   };
 }
 
@@ -148,15 +164,17 @@ export function parseUpsRateResponse(
   body: unknown,
   carrierId: string
 ): RateResponse {
-  if (!body || typeof body !== "object") {
+  const parsed = UpsRateResponseSchema.safeParse(body);
+  if (!parsed.success) {
+    const message = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
     throw new CarrierIntegrationError({
       code: "MALFORMED_RESPONSE",
-      message: "UPS rate response is not an object",
-      context: { body },
+      message: `UPS rate response invalid — ${message}`,
+      context: { body, issues: parsed.error.flatten() },
     });
   }
 
-  const rateResponse = (body as UpsRateResponse).RateResponse;
+  const rateResponse = parsed.data.RateResponse;
   if (!rateResponse) {
     throw new CarrierIntegrationError({
       code: "MALFORMED_RESPONSE",
@@ -182,16 +200,19 @@ export function parseUpsRateResponse(
     const total = s.TotalCharges?.MonetaryValue;
     const currency = s.TotalCharges?.CurrencyCode ?? "USD";
     const transitDays = s.GuaranteedDelivery?.BusinessDaysInTransit;
+    const totalCharge =
+      total != null && total !== "" ? parseFloat(total) : 0;
+    const transitDaysNum =
+      transitDays != null && transitDays !== ""
+        ? parseInt(transitDays, 10)
+        : undefined;
     return {
       carrier: carrierId,
       serviceCode: code,
       serviceName: svc?.Name ?? upsServiceName(code),
-      totalCharge: total != null ? parseFloat(total) : 0,
-      currencyCode: currency,
-      transitDays:
-        transitDays != null && transitDays !== ""
-          ? parseInt(transitDays, 10)
-          : undefined,
+      totalCharge: Number.isNaN(totalCharge) ? 0 : totalCharge,
+      currencyCode: currency ?? "USD",
+      transitDays: transitDaysNum != null && !Number.isNaN(transitDaysNum) ? transitDaysNum : undefined,
       carrierServiceId: code,
     };
   });

@@ -3,9 +3,17 @@
  * Callers use getValidToken() and never deal with raw tokens or expiry.
  */
 
+import { z } from "zod";
 import type { HttpClient } from "../http-client.js";
 import type { UpsConfig } from "../config.js";
 import { CarrierIntegrationError } from "../errors.js";
+
+/** Runtime validation for UPS OAuth token response. */
+const UpsOAuthTokenResponseSchema = z.object({
+  access_token: z.string().min(1, "access_token is required"),
+  expires_in: z.number().int().positive().optional().default(3600),
+  token_type: z.string().optional(),
+});
 
 export interface TokenResult {
   accessToken: string;
@@ -64,7 +72,7 @@ export class UpsOAuthClient {
     ).toString("base64");
 
     try {
-      const res = await this.http.request<UpsOAuthTokenResponse>({
+      const res = await this.http.request<unknown>({
         method: "POST",
         url,
         headers: {
@@ -103,26 +111,22 @@ export class UpsOAuthClient {
         });
       }
 
-      const data = res.body;
-      if (
-        !data ||
-        typeof data !== "object" ||
-        typeof (data as { access_token?: string }).access_token !== "string"
-      ) {
+      const parsed = UpsOAuthTokenResponseSchema.safeParse(res.body);
+      if (!parsed.success) {
+        const message = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
         throw new CarrierIntegrationError({
           code: "MALFORMED_RESPONSE",
-          message: "UPS OAuth: response missing access_token",
+          message: `UPS OAuth: invalid response — ${message}`,
           statusCode: res.status,
-          context: { body: data },
+          context: { body: res.body, issues: parsed.error.flatten() },
         });
       }
 
-      const token = (data as UpsOAuthTokenResponse).access_token;
-      const rawExpiresIn = (data as UpsOAuthTokenResponse).expires_in;
-      const expiresInSeconds =
-        typeof rawExpiresIn === "number" ? rawExpiresIn : 3600;
-
-      return { accessToken: token, expiresInSeconds };
+      const { access_token, expires_in } = parsed.data;
+      return {
+        accessToken: access_token,
+        expiresInSeconds: expires_in,
+      };
     } catch (err) {
       if (err instanceof CarrierIntegrationError) throw err;
       const message =
@@ -138,10 +142,4 @@ export class UpsOAuthClient {
       });
     }
   }
-}
-
-interface UpsOAuthTokenResponse {
-  access_token: string;
-  expires_in?: number;
-  token_type?: string;
 }
